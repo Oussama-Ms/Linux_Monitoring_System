@@ -2,6 +2,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "utils.h"
+#include <string.h>
+#include "signals.h"
+
 
 // Affiche le mode d'emploi du programme
 void print_usage(const char *prog_name) {
@@ -30,4 +33,57 @@ int check_directory_exists(const char *path) {
     }
 
     return SUCCESS;
+}
+
+
+// Initialise les mutex et variables de condition
+void queue_init(EventQueue *q) {
+    q->head = 0;
+    q->tail = 0;
+    q->count = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->cond_non_empty, NULL);
+}
+
+// Le Monitor appelle cette fonction pour ajouter un événement
+void queue_push(EventQueue *q, FileEvent event) {
+    pthread_mutex_lock(&q->mutex);
+    
+    // Si la file est pleine, on écrase le plus ancien (logique circulaire basique)
+    if (q->count == QUEUE_SIZE) {
+        q->head = (q->head + 1) % QUEUE_SIZE;
+        q->count--;
+    }
+    
+    q->events[q->tail] = event;
+    q->tail = (q->tail + 1) % QUEUE_SIZE;
+    q->count++;
+    
+    // On réveille le Logger qui dort en attendant un événement
+    pthread_cond_signal(&q->cond_non_empty);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+// Le Logger appelle cette fonction pour récupérer un événement (bloquant si vide)
+FileEvent queue_pop(EventQueue *q) {
+    pthread_mutex_lock(&q->mutex);
+    
+    // On s'endort TANT QUE la file est vide ET qu'on doit continuer à tourner
+    while (q->count == 0 && keep_running) {
+        pthread_cond_wait(&q->cond_non_empty, &q->mutex);
+    }
+    
+    FileEvent event;
+    // Si on a été réveillé par un Ctrl+C et que la file est vide
+    if (!keep_running && q->count == 0) {
+        event.type = EV_UNKNOWN; // Valeur "fantôme" pour dire au Logger de quitter
+    } else {
+        // Comportement normal
+        event = q->events[q->head];
+        q->head = (q->head + 1) % QUEUE_SIZE;
+        q->count--;
+    }
+    
+    pthread_mutex_unlock(&q->mutex);
+    return event;
 }

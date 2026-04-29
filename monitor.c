@@ -3,11 +3,17 @@
 #include <unistd.h>
 #include <sys/inotify.h>
 #include <limits.h>
-#include <linux/limits.h> // Ajout crucial pour NAME_MAX sous Ubuntu
+#include <linux/limits.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>    // Pour détecter l'erreur d'interruption
 #include "monitor.h"
 #include "config.h"
+#include "utils.h"
+#include "signals.h"
+#include <poll.h>
+#include "stats.h"
 
-// Sécurité : Si NAME_MAX n'est toujours pas défini, on le force à 255
 #ifndef NAME_MAX
 #define NAME_MAX 255
 #endif
@@ -19,22 +25,42 @@ void *monitor_thread(void *arg) {
     char buffer[BUF_LEN];
 
     int fd = inotify_init();
-    if (fd < 0) {
-        perror("Erreur inotify_init");
-        return NULL;
-    }
+    if (fd < 0) { perror("Erreur inotify_init"); return NULL; }
 
     int wd = inotify_add_watch(fd, target_dir, IN_CREATE | IN_DELETE | IN_MODIFY | IN_MOVED_FROM | IN_MOVED_TO);
-    if (wd == -1) {
-        perror("Erreur inotify_add_watch");
-        close(fd);
-        return NULL;
-    }
+    if (wd == -1) { perror("Erreur inotify_add_watch"); close(fd); return NULL; }
 
     printf("[MONITOR] En écoute sur le répertoire : %s\n", target_dir);
-    fflush(stdout); // On force l'affichage immédiat
+    fflush(stdout);
 
-    while (1) {
+    // On utilise keep_running ici !
+    while (keep_running) {
+    
+        // On vérifie si un signal SIGUSR1 a levé ce drapeau !
+        if (print_stats_request) {
+            // On affiche les statistiques de manière thread-safe (grâce au mutex dans stats.c)
+            stats_print(); 
+            
+            // On rabaisse le drapeau pour ne pas réafficher les stats à la boucle suivante
+            print_stats_request = 0; 
+        }
+        // Préparation de poll() pour surveiller notre file descriptor inotify (fd)
+        struct pollfd pfd = { fd, POLLIN, 0 };
+        
+        // On attend un événement pendant maximum 500 millisecondes
+        int poll_ret = poll(&pfd, 1, 500);
+
+        if (poll_ret < 0) {
+            if (errno == EINTR) break; // Interrompu par Ctrl+C
+            perror("Erreur poll");
+            break;
+        } else if (poll_ret == 0) {
+            // Le délai de 500ms est écoulé, il ne s'est rien passé.
+            // On fait un 'continue' pour remonter au début du while et vérifier 'keep_running' !
+            continue;
+        }
+
+        // Si on arrive ici, c'est qu'il y a vraiment un événement à lire !
         int length = read(fd, buffer, BUF_LEN);  
         
         if (length < 0) {
@@ -47,25 +73,26 @@ void *monitor_thread(void *arg) {
             struct inotify_event *event = (struct inotify_event *)&buffer[i];
 
             if (event->len) {
-                if (event->mask & IN_CREATE) {
-                    printf("[ÉVÉNEMENT] Création détectée : %s\n", event->name);
-                }
-                else if (event->mask & IN_DELETE) {
-                    printf("[ÉVÉNEMENT] Suppression détectée : %s\n", event->name);
-                }
-                else if (event->mask & IN_MODIFY) {
-                    printf("[ÉVÉNEMENT] Modification détectée : %s\n", event->name);
-                }
-                else if (event->mask & (IN_MOVED_FROM | IN_MOVED_TO)) {
-                    printf("[ÉVÉNEMENT] Renommage/Déplacement détecté : %s\n", event->name);
+                FileEvent new_event;
+                new_event.timestamp = time(NULL);
+                strncpy(new_event.filepath, event->name, MAX_PATH_LEN - 1);
+                new_event.filepath[MAX_PATH_LEN - 1] = '\0';
+
+                if (event->mask & IN_CREATE) new_event.type = EV_CREATE;
+                else if (event->mask & IN_DELETE) new_event.type = EV_DELETE;
+                else if (event->mask & IN_MODIFY) new_event.type = EV_MODIFY;
+                else if (event->mask & (IN_MOVED_FROM | IN_MOVED_TO)) new_event.type = EV_RENAME;
+                else new_event.type = EV_UNKNOWN;
+
+                if(new_event.type != EV_UNKNOWN) {
+                    queue_push(&event_queue, new_event);
                 }
             }
             i += sizeof(struct inotify_event) + event->len;
         }
-        // IMPORTANT : Forcer l'affichage à l'écran après chaque rafale d'événements
-        fflush(stdout);
     }
 
+    printf("\n[MONITOR] Arrêt de la surveillance...\n");
     inotify_rm_watch(fd, wd);
     close(fd);
     return NULL;
